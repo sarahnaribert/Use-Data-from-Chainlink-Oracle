@@ -7,6 +7,9 @@
 (define-constant ERR_INVALID_AMOUNT (err u105))
 (define-constant ERR_POSITION_NOT_FOUND (err u106))
 (define-constant ERR_POSITION_ALREADY_EXISTS (err u107))
+(define-constant ERR_INVALID_WEIGHT (err u108))
+(define-constant ERR_INSUFFICIENT_SOURCES (err u109))
+(define-constant ERR_PRICE_DEVIATION (err u110))
 
 (define-map oracle-feeds 
   { feed-id: (string-ascii 32) }
@@ -38,6 +41,16 @@
     is-above: bool,
     is-active: bool,
     created-at: uint
+  }
+)
+
+(define-map aggregation-config
+  { asset: (string-ascii 32) }
+  {
+    feeds: (list 10 (string-ascii 32)),
+    weights: (list 10 uint),
+    min-sources: uint,
+    max-deviation: uint
   }
 )
 
@@ -285,6 +298,97 @@
   )
 )
 
+(define-public (configure-aggregation
+  (asset (string-ascii 32))
+  (feeds (list 10 (string-ascii 32)))
+  (weights (list 10 uint))
+  (min-sources uint)
+  (max-deviation uint)
+)
+  (let (
+    (total-weight (fold + weights u0))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (len feeds) (len weights)) ERR_INVALID_WEIGHT)
+    (asserts! (and (> min-sources u0) (<= min-sources (len feeds))) ERR_INSUFFICIENT_SOURCES)
+    (asserts! (is-eq total-weight u10000) ERR_INVALID_WEIGHT)
+    
+    (map-set aggregation-config
+      { asset: asset }
+      {
+        feeds: feeds,
+        weights: weights,
+        min-sources: min-sources,
+        max-deviation: max-deviation
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-aggregated-price (asset (string-ascii 32)))
+  (match (map-get? aggregation-config { asset: asset })
+    config
+      (let (
+        (prices (map get-feed-price (get feeds config)))
+        (valid-prices (filter is-valid-price prices))
+        (valid-count (len valid-prices))
+      )
+        (if (>= valid-count (get min-sources config))
+          (let (
+            (weighted-prices (map multiply-by-weight valid-prices (get weights config)))
+            (weighted-sum (fold + weighted-prices u0))
+            (weight-sum (fold + (get weights config) u0))
+            (avg-price (/ weighted-sum weight-sum))
+          )
+            (if (is-within-deviation valid-prices avg-price (get max-deviation config))
+              (ok avg-price)
+              ERR_PRICE_DEVIATION
+            )
+          )
+          ERR_INSUFFICIENT_SOURCES
+        )
+      )
+    ERR_ORACLE_NOT_FOUND
+  )
+)
+
+(define-read-only (get-aggregation-config (asset (string-ascii 32)))
+  (map-get? aggregation-config { asset: asset })
+)
+
+(define-private (get-feed-price (feed-id (string-ascii 32)))
+  (match (get-latest-price feed-id)
+    ok-price ok-price
+    err-code u0
+  )
+)
+
+(define-private (is-valid-price (price uint))
+  (> price u0)
+)
+
+(define-private (multiply-by-weight (price uint) (weight uint))
+  (/ (* price weight) u10000)
+)
+
+(define-private (is-within-deviation (prices (list 10 uint)) (avg-price uint) (max-deviation uint))
+  (let (
+    (max-diff (fold max-price-diff prices u0))
+    (deviation (/ (* max-diff u10000) avg-price))
+  )
+    (<= deviation max-deviation)
+  )
+)
+
+(define-private (max-price-diff (price uint) (current-max uint))
+  (let (
+    (diff (if (> price current-max) (- price current-max) (- current-max price)))
+  )
+    (if (> diff current-max) diff current-max)
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-feeds: (var-get total-feeds),
@@ -293,3 +397,6 @@
     contract-owner: CONTRACT_OWNER
   }
 )
+
+
+
