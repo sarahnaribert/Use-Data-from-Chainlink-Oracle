@@ -10,6 +10,8 @@
 (define-constant ERR_INVALID_WEIGHT (err u108))
 (define-constant ERR_INSUFFICIENT_SOURCES (err u109))
 (define-constant ERR_PRICE_DEVIATION (err u110))
+(define-constant ERR_ORACLE_SLASHED (err u111))
+(define-constant ERR_REPUTATION_TOO_LOW (err u112))
 
 (define-map oracle-feeds 
   { feed-id: (string-ascii 32) }
@@ -54,13 +56,46 @@
   }
 )
 
+(define-map oracle-reputation
+  { oracle: principal }
+  {
+    total-updates: uint,
+    accurate-updates: uint,
+    score: uint,
+    last-updated: uint,
+    is-slashed: bool
+  }
+)
+
+(define-map price-validations
+  { feed-id: (string-ascii 32), block-height: uint }
+  {
+    predicted-price: uint,
+    actual-price: uint,
+    oracle: principal,
+    validated: bool
+  }
+)
+
 (define-data-var total-feeds uint u0)
 (define-data-var alert-fee uint u1000000)
 (define-data-var max-price-age uint u3600)
+(define-data-var min-reputation-score uint u5000)
+(define-data-var validation-window uint u144)
 
 (define-public (add-oracle (oracle principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set oracle-reputation
+      { oracle: oracle }
+      {
+        total-updates: u0,
+        accurate-updates: u0,
+        score: u10000,
+        last-updated: stacks-block-height,
+        is-slashed: false
+      }
+    )
     (ok (map-set authorized-oracles oracle true))
   )
 )
@@ -101,10 +136,24 @@
   (let (
     (oracle-authorized (default-to false (map-get? authorized-oracles tx-sender)))
     (feed-data (map-get? oracle-feeds { feed-id: feed-id }))
+    (reputation (default-to { total-updates: u0, accurate-updates: u0, score: u10000, last-updated: u0, is-slashed: false } 
+                           (map-get? oracle-reputation { oracle: tx-sender })))
   )
     (asserts! oracle-authorized ERR_UNAUTHORIZED)
     (asserts! (is-some feed-data) ERR_ORACLE_NOT_FOUND)
     (asserts! (> new-price u0) ERR_INVALID_PRICE)
+    (asserts! (not (get is-slashed reputation)) ERR_ORACLE_SLASHED)
+    (asserts! (>= (get score reputation) (var-get min-reputation-score)) ERR_REPUTATION_TOO_LOW)
+    
+    (map-set price-validations
+      { feed-id: feed-id, block-height: stacks-block-height }
+      {
+        predicted-price: new-price,
+        actual-price: u0,
+        oracle: tx-sender,
+        validated: false
+      }
+    )
     
     (map-set oracle-feeds 
       { feed-id: feed-id }
@@ -389,14 +438,134 @@
   )
 )
 
+(define-public (validate-price
+  (feed-id (string-ascii 32))
+  (height uint)
+  (actual-price uint)
+)
+  (let (
+    (validation-key { feed-id: feed-id, block-height: height })
+    (validation (map-get? price-validations validation-key))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-some validation) ERR_ORACLE_NOT_FOUND)
+    (asserts! (>= stacks-block-height (+ height (var-get validation-window))) ERR_STALE_DATA)
+    
+    (let (
+      (validation-data (unwrap-panic validation))
+      (oracle (get oracle validation-data))
+      (predicted-price (get predicted-price validation-data))
+      (is-accurate (is-price-accurate predicted-price actual-price))
+    )
+      (map-set price-validations
+        validation-key
+        (merge validation-data {
+          actual-price: actual-price,
+          validated: true
+        })
+      )
+      
+      (begin
+        (unwrap-panic (update-oracle-reputation oracle is-accurate))
+        (ok is-accurate)
+      )
+    )
+  )
+)
+
+(define-public (slash-oracle (oracle principal))
+  (let (
+    (reputation (map-get? oracle-reputation { oracle: oracle }))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-some reputation) ERR_ORACLE_NOT_FOUND)
+    
+    (map-set oracle-reputation
+      { oracle: oracle }
+      (merge (unwrap-panic reputation) { is-slashed: true })
+    )
+    (map-delete authorized-oracles oracle)
+    (ok true)
+  )
+)
+
+(define-public (set-min-reputation-score (new-score uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-score u10000) ERR_INVALID_AMOUNT)
+    (var-set min-reputation-score new-score)
+    (ok true)
+  )
+)
+
+(define-public (set-validation-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set validation-window new-window)
+    (ok true)
+  )
+)
+
+(define-read-only (get-oracle-reputation (oracle principal))
+  (map-get? oracle-reputation { oracle: oracle })
+)
+
+(define-read-only (get-price-validation (feed-id (string-ascii 32)) (height uint))
+  (map-get? price-validations { feed-id: feed-id, block-height: height })
+)
+
+(define-read-only (get-oracle-score (oracle principal))
+  (match (map-get? oracle-reputation { oracle: oracle })
+    reputation (ok (get score reputation))
+    ERR_ORACLE_NOT_FOUND
+  )
+)
+
+(define-private (update-oracle-reputation (oracle principal) (is-accurate bool))
+  (let (
+    (current-rep (default-to { total-updates: u0, accurate-updates: u0, score: u10000, last-updated: u0, is-slashed: false }
+                             (map-get? oracle-reputation { oracle: oracle })))
+    (new-total (+ (get total-updates current-rep) u1))
+    (new-accurate (if is-accurate (+ (get accurate-updates current-rep) u1) (get accurate-updates current-rep)))
+    (new-score (calculate-reputation-score new-accurate new-total))
+  )
+    (map-set oracle-reputation
+      { oracle: oracle }
+      {
+        total-updates: new-total,
+        accurate-updates: new-accurate,
+        score: new-score,
+        last-updated: stacks-block-height,
+        is-slashed: (get is-slashed current-rep)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (is-price-accurate (predicted uint) (actual uint))
+  (let (
+    (tolerance (/ actual u20))
+    (diff (if (> predicted actual) (- predicted actual) (- actual predicted)))
+  )
+    (<= diff tolerance)
+  )
+)
+
+(define-private (calculate-reputation-score (accurate uint) (total uint))
+  (if (is-eq total u0)
+    u10000
+    (/ (* accurate u10000) total)
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-feeds: (var-get total-feeds),
     alert-fee: (var-get alert-fee),
     max-price-age: (var-get max-price-age),
+    min-reputation-score: (var-get min-reputation-score),
+    validation-window: (var-get validation-window),
     contract-owner: CONTRACT_OWNER
   }
 )
-
-
-
