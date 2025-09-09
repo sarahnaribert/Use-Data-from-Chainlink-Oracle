@@ -12,6 +12,8 @@
 (define-constant ERR_PRICE_DEVIATION (err u110))
 (define-constant ERR_ORACLE_SLASHED (err u111))
 (define-constant ERR_REPUTATION_TOO_LOW (err u112))
+(define-constant ERR_CIRCUIT_BREAKER_ACTIVE (err u113))
+(define-constant ERR_INVALID_THRESHOLD (err u114))
 
 (define-map oracle-feeds 
   { feed-id: (string-ascii 32) }
@@ -77,11 +79,34 @@
   }
 )
 
+(define-map circuit-breakers
+  { feed-id: (string-ascii 32) }
+  {
+    is-active: bool,
+    threshold-percent: uint,
+    cooldown-blocks: uint,
+    triggered-at: uint,
+    last-price: uint,
+    trigger-reason: (string-ascii 64)
+  }
+)
+
+(define-map price-snapshots
+  { feed-id: (string-ascii 32), snapshot-height: uint }
+  {
+    price: uint,
+    timestamp: uint
+  }
+)
+
 (define-data-var total-feeds uint u0)
 (define-data-var alert-fee uint u1000000)
 (define-data-var max-price-age uint u3600)
 (define-data-var min-reputation-score uint u5000)
 (define-data-var validation-window uint u144)
+(define-data-var global-circuit-breaker bool false)
+(define-data-var default-threshold-percent uint u2000)
+(define-data-var default-cooldown-blocks uint u144)
 
 (define-public (add-oracle (oracle principal))
   (begin
@@ -178,6 +203,8 @@
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (is-ok current-price) ERR_ORACLE_NOT_FOUND)
     (asserts! (is-none (map-get? user-positions position-key)) ERR_POSITION_ALREADY_EXISTS)
+    (asserts! (not (var-get global-circuit-breaker)) ERR_CIRCUIT_BREAKER_ACTIVE)
+    (asserts! (not (is-circuit-breaker-active asset)) ERR_CIRCUIT_BREAKER_ACTIVE)
     
     (map-set user-positions
       position-key
@@ -200,6 +227,8 @@
   )
     (asserts! (is-some position) ERR_POSITION_NOT_FOUND)
     (asserts! (is-ok current-price) ERR_ORACLE_NOT_FOUND)
+    (asserts! (not (var-get global-circuit-breaker)) ERR_CIRCUIT_BREAKER_ACTIVE)
+    (asserts! (not (is-circuit-breaker-active asset)) ERR_CIRCUIT_BREAKER_ACTIVE)
     
     (map-delete user-positions position-key)
     (ok (calculate-pnl 
@@ -559,6 +588,183 @@
   )
 )
 
+(define-public (configure-circuit-breaker
+  (feed-id (string-ascii 32))
+  (threshold-percent uint)
+  (cooldown-blocks uint)
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (> threshold-percent u0) (<= threshold-percent u10000)) ERR_INVALID_THRESHOLD)
+    
+    (map-set circuit-breakers
+      { feed-id: feed-id }
+      {
+        is-active: false,
+        threshold-percent: threshold-percent,
+        cooldown-blocks: cooldown-blocks,
+        triggered-at: u0,
+        last-price: u0,
+        trigger-reason: ""
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (trigger-circuit-breaker
+  (feed-id (string-ascii 32))
+  (reason (string-ascii 64))
+)
+  (let (
+    (current-price-result (get-latest-price feed-id))
+    (breaker-config (map-get? circuit-breakers { feed-id: feed-id }))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-some breaker-config) ERR_ORACLE_NOT_FOUND)
+    (asserts! (is-ok current-price-result) ERR_ORACLE_NOT_FOUND)
+    
+    (let (
+      (current-price (unwrap-panic current-price-result))
+      (config (unwrap-panic breaker-config))
+    )
+      (map-set circuit-breakers
+        { feed-id: feed-id }
+        (merge config {
+          is-active: true,
+          triggered-at: stacks-block-height,
+          last-price: current-price,
+          trigger-reason: reason
+        })
+      )
+      (create-price-snapshot feed-id current-price)
+      (ok true)
+    )
+  )
+)
+
+(define-public (auto-check-circuit-breaker (feed-id (string-ascii 32)))
+  (let (
+    (current-price-result (get-latest-price feed-id))
+    (breaker-config (map-get? circuit-breakers { feed-id: feed-id }))
+    (last-snapshot (get-recent-price-snapshot feed-id))
+  )
+    (asserts! (is-ok current-price-result) ERR_ORACLE_NOT_FOUND)
+    (asserts! (is-some breaker-config) ERR_ORACLE_NOT_FOUND)
+    (asserts! (is-some last-snapshot) (ok false))
+    
+    (let (
+      (current-price (unwrap-panic current-price-result))
+      (config (unwrap-panic breaker-config))
+      (snapshot (unwrap-panic last-snapshot))
+      (price-change-percent (calculate-price-change-percent 
+                            (get price snapshot) 
+                            current-price))
+    )
+      (if (> price-change-percent (get threshold-percent config))
+        (begin
+          (map-set circuit-breakers
+            { feed-id: feed-id }
+            (merge config {
+              is-active: true,
+              triggered-at: stacks-block-height,
+              last-price: current-price,
+              trigger-reason: "automatic-threshold-breach"
+            })
+          )
+          (ok true)
+        )
+        (begin
+          (create-price-snapshot feed-id current-price)
+          (ok false)
+        )
+      )
+    )
+  )
+)
+
+(define-public (reset-circuit-breaker (feed-id (string-ascii 32)))
+  (let (
+    (breaker-config (map-get? circuit-breakers { feed-id: feed-id }))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-some breaker-config) ERR_ORACLE_NOT_FOUND)
+    
+    (let (
+      (config (unwrap-panic breaker-config))
+    )
+      (asserts! (>= stacks-block-height (+ (get triggered-at config) (get cooldown-blocks config))) ERR_STALE_DATA)
+      
+      (map-set circuit-breakers
+        { feed-id: feed-id }
+        (merge config {
+          is-active: false,
+          triggered-at: u0,
+          trigger-reason: ""
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-global-circuit-breaker (active bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set global-circuit-breaker active)
+    (ok true)
+  )
+)
+
+(define-public (set-default-threshold (threshold-percent uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (> threshold-percent u0) (<= threshold-percent u10000)) ERR_INVALID_THRESHOLD)
+    (var-set default-threshold-percent threshold-percent)
+    (ok true)
+  )
+)
+
+(define-read-only (get-circuit-breaker-status (feed-id (string-ascii 32)))
+  (map-get? circuit-breakers { feed-id: feed-id })
+)
+
+(define-read-only (is-circuit-breaker-active (feed-id (string-ascii 32)))
+  (match (map-get? circuit-breakers { feed-id: feed-id })
+    breaker (get is-active breaker)
+    false
+  )
+)
+
+(define-read-only (get-price-snapshot (feed-id (string-ascii 32)) (height uint))
+  (map-get? price-snapshots { feed-id: feed-id, snapshot-height: height })
+)
+
+(define-private (create-price-snapshot (feed-id (string-ascii 32)) (price uint))
+  (map-set price-snapshots
+    { feed-id: feed-id, snapshot-height: stacks-block-height }
+    {
+      price: price,
+      timestamp: stacks-block-height
+    }
+  )
+)
+
+(define-private (get-recent-price-snapshot (feed-id (string-ascii 32)))
+  (map-get? price-snapshots { feed-id: feed-id, snapshot-height: (- stacks-block-height u1) })
+)
+
+(define-private (calculate-price-change-percent (old-price uint) (new-price uint))
+  (let (
+    (price-diff (if (> new-price old-price) 
+                   (- new-price old-price) 
+                   (- old-price new-price)))
+    (change-percent (/ (* price-diff u10000) old-price))
+  )
+    change-percent
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-feeds: (var-get total-feeds),
@@ -566,6 +772,9 @@
     max-price-age: (var-get max-price-age),
     min-reputation-score: (var-get min-reputation-score),
     validation-window: (var-get validation-window),
+    global-circuit-breaker: (var-get global-circuit-breaker),
+    default-threshold-percent: (var-get default-threshold-percent),
+    default-cooldown-blocks: (var-get default-cooldown-blocks),
     contract-owner: CONTRACT_OWNER
   }
 )
