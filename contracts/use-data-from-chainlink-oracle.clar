@@ -14,6 +14,8 @@
 (define-constant ERR_REPUTATION_TOO_LOW (err u112))
 (define-constant ERR_CIRCUIT_BREAKER_ACTIVE (err u113))
 (define-constant ERR_INVALID_THRESHOLD (err u114))
+(define-constant ERR_INSUFFICIENT_OBSERVATIONS (err u115))
+(define-constant ERR_INVALID_PERIOD (err u116))
 
 (define-map oracle-feeds 
   { feed-id: (string-ascii 32) }
@@ -99,6 +101,24 @@
   }
 )
 
+(define-map twap-observations
+  { feed-id: (string-ascii 32), observation-index: uint }
+  {
+    price: uint,
+    timestamp: uint,
+    cumulative-price: uint
+  }
+)
+
+(define-map twap-config
+  { feed-id: (string-ascii 32) }
+  {
+    observation-count: uint,
+    current-index: uint,
+    initialized: bool
+  }
+)
+
 (define-data-var total-feeds uint u0)
 (define-data-var alert-fee uint u1000000)
 (define-data-var max-price-age uint u3600)
@@ -107,6 +127,7 @@
 (define-data-var global-circuit-breaker bool false)
 (define-data-var default-threshold-percent uint u2000)
 (define-data-var default-cooldown-blocks uint u144)
+(define-data-var max-twap-observations uint u100)
 
 (define-public (add-oracle (oracle principal))
   (begin
@@ -187,6 +208,8 @@
         updated-at: stacks-block-height
       })
     )
+    
+    (record-twap-observation feed-id new-price)
     (ok new-price)
   )
 )
@@ -765,6 +788,134 @@
   )
 )
 
+(define-public (initialize-twap (feed-id (string-ascii 32)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    
+    (map-set twap-config
+      { feed-id: feed-id }
+      {
+        observation-count: u0,
+        current-index: u0,
+        initialized: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-twap (feed-id (string-ascii 32)) (period-blocks uint))
+  (let (
+    (config (map-get? twap-config { feed-id: feed-id }))
+  )
+    (asserts! (is-some config) ERR_ORACLE_NOT_FOUND)
+    (asserts! (> period-blocks u0) ERR_INVALID_PERIOD)
+    
+    (let (
+      (config-data (unwrap-panic config))
+      (obs-count (get observation-count config-data))
+      (current-idx (get current-index config-data))
+    )
+      (asserts! (>= obs-count u2) ERR_INSUFFICIENT_OBSERVATIONS)
+      
+      (ok (calculate-twap feed-id period-blocks obs-count current-idx))
+    )
+  )
+)
+
+(define-read-only (get-twap-1h (feed-id (string-ascii 32)))
+  (get-twap feed-id u60)
+)
+
+(define-read-only (get-twap-24h (feed-id (string-ascii 32)))
+  (get-twap feed-id u1440)
+)
+
+(define-read-only (get-twap-7d (feed-id (string-ascii 32)))
+  (get-twap feed-id u10080)
+)
+
+(define-read-only (get-twap-config (feed-id (string-ascii 32)))
+  (map-get? twap-config { feed-id: feed-id })
+)
+
+(define-read-only (get-twap-observation (feed-id (string-ascii 32)) (index uint))
+  (map-get? twap-observations { feed-id: feed-id, observation-index: index })
+)
+
+(define-private (record-twap-observation (feed-id (string-ascii 32)) (price uint))
+  (let (
+    (config (map-get? twap-config { feed-id: feed-id }))
+  )
+    (if (is-none config)
+      false
+      (let (
+        (config-data (unwrap-panic config))
+        (current-idx (get current-index config-data))
+        (obs-count (get observation-count config-data))
+        (previous-obs (map-get? twap-observations { feed-id: feed-id, observation-index: current-idx }))
+        (previous-cumulative (if (is-some previous-obs) 
+                                (get cumulative-price (unwrap-panic previous-obs)) 
+                                u0))
+        (new-cumulative (+ previous-cumulative price))
+        (next-idx (mod (+ current-idx u1) (var-get max-twap-observations)))
+      )
+        (map-set twap-observations
+          { feed-id: feed-id, observation-index: next-idx }
+          {
+            price: price,
+            timestamp: stacks-block-height,
+            cumulative-price: new-cumulative
+          }
+        )
+        
+        (map-set twap-config
+          { feed-id: feed-id }
+          {
+            observation-count: (if (< obs-count (var-get max-twap-observations)) 
+                                  (+ obs-count u1) 
+                                  obs-count),
+            current-index: next-idx,
+            initialized: true
+          }
+        )
+        true
+      )
+    )
+  )
+)
+
+(define-private (calculate-twap 
+  (feed-id (string-ascii 32)) 
+  (period-blocks uint) 
+  (obs-count uint) 
+  (current-idx uint)
+)
+  (let (
+    (observations-to-use (if (< period-blocks obs-count) period-blocks obs-count))
+    (start-idx (if (>= current-idx observations-to-use)
+                  (- current-idx observations-to-use)
+                  (+ (var-get max-twap-observations) (- current-idx observations-to-use))))
+    (start-obs (map-get? twap-observations { feed-id: feed-id, observation-index: start-idx }))
+    (end-obs (map-get? twap-observations { feed-id: feed-id, observation-index: current-idx }))
+  )
+    (if (and (is-some start-obs) (is-some end-obs))
+      (let (
+        (start-data (unwrap-panic start-obs))
+        (end-data (unwrap-panic end-obs))
+        (cumulative-diff (- (get cumulative-price end-data) (get cumulative-price start-data)))
+        (time-diff (- (get timestamp end-data) (get timestamp start-data)))
+      )
+        (if (> time-diff u0)
+          (/ cumulative-diff time-diff)
+          (get price end-data)
+        )
+      )
+      u0
+    )
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-feeds: (var-get total-feeds),
@@ -775,6 +926,7 @@
     global-circuit-breaker: (var-get global-circuit-breaker),
     default-threshold-percent: (var-get default-threshold-percent),
     default-cooldown-blocks: (var-get default-cooldown-blocks),
+    max-twap-observations: (var-get max-twap-observations),
     contract-owner: CONTRACT_OWNER
   }
 )
