@@ -930,3 +930,75 @@
     contract-owner: CONTRACT_OWNER
   }
 )
+
+(define-private (pow10 (n uint))
+  (if (is-eq n u0) u1
+    (if (is-eq n u1) u10
+      (if (is-eq n u2) u100
+        (if (is-eq n u3) u1000
+          (if (is-eq n u4) u10000
+            (if (is-eq n u5) u100000
+              (if (is-eq n u6) u1000000
+                (if (is-eq n u7) u10000000
+                  (if (is-eq n u8) u100000000
+                    (if (is-eq n u9) u1000000000
+                      (if (is-eq n u10) u10000000000
+                        (if (is-eq n u11) u100000000000
+                          (if (is-eq n u12) u1000000000000
+                            (if (is-eq n u13) u10000000000000
+                              (if (is-eq n u14) u100000000000000
+                                (if (is-eq n u15) u1000000000000000
+                                  (if (is-eq n u16) u10000000000000000
+                                    (if (is-eq n u17) u100000000000000000
+                                      (if (is-eq n u18) u1000000000000000000
+                                        u1
+                                      )
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-normalized-price (feed-id (string-ascii 32)) (target-decimals uint))
+  (let (
+    (feed (map-get? oracle-feeds { feed-id: feed-id }))
+  )
+    (match feed
+      some-feed
+        (let (
+          (price (get price some-feed))
+          (decimals (get decimals some-feed))
+        )
+          (if (is-eq decimals target-decimals)
+            (ok price)
+            (let (
+              (diff (if (> target-decimals decimals)
+                        (- target-decimals decimals)
+                        (- decimals target-decimals)))
+              (scale (pow10 diff))
+            )
+              (if (> target-decimals decimals)
+                (ok (* price scale))
+                (ok (/ price scale))
+              )
+            )
+          )
+        )
+      ERR_ORACLE_NOT_FOUND
+    )
+  )
+)
